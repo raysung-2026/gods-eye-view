@@ -628,24 +628,63 @@ export async function fetchCctvImageFromUpstream(
       fetchImpl,
     );
     if (!upstream || !upstream.ok) {
+      // Only the FAILURE paths log — a healthy image fetch never reaches
+      // here, so this stays silent for the large majority of providers and
+      // only speaks up for a camera that's actually broken right now.
+      console.warn(
+        '[CCTV] upstream frame fetch: no response or non-2xx',
+        new URL(url).host,
+        upstream ? upstream.status : '(no response)',
+      );
       controller.abort();
       return null;
     }
     const contentType = upstream.headers.get('content-type') || '';
     if (contentType.startsWith('image/')) {
       const body = await readCappedResponseBytes(upstream, maxBytes);
-      if (!body) return null;
+      if (!body) {
+        console.warn(
+          '[CCTV] upstream frame fetch: image body rejected (size cap or empty)',
+          new URL(url).host,
+        );
+        return null;
+      }
       return { ok: true, body, contentType };
     }
     if (/^multipart\/x-mixed-replace/i.test(contentType)) {
       const boundaryToken = parseMultipartBoundary(contentType);
       const frame = await extractOneMjpegFrame(upstream, boundaryToken, maxBytes);
-      if (!frame) return null;
+      if (!frame) {
+        console.warn(
+          '[CCTV] upstream MJPEG fetch: no complete frame found before cap/close',
+          new URL(url).host,
+          'boundary=',
+          boundaryToken || '(none declared)',
+        );
+        return null;
+      }
       return frame;
     }
+    console.warn(
+      '[CCTV] upstream frame fetch: unexpected content-type',
+      new URL(url).host,
+      JSON.stringify(contentType),
+    );
     controller.abort();
     return null;
-  } catch {
+  } catch (error) {
+    console.warn(
+      '[CCTV] upstream frame fetch threw:',
+      (() => {
+        try {
+          return new URL(url).host;
+        } catch {
+          return url;
+        }
+      })(),
+      error?.name || '',
+      error?.message || error,
+    );
     return null;
   } finally {
     clearTimeout(timeoutId);
