@@ -18,6 +18,7 @@ import {
   loadNswSourcesFromOpenData,
   loadCalgarySourcesFromOpenData,
   loadDelDOTSourcesFromOpenData,
+  loadTaiwanFreewaySourcesFromOpenData,
 } from './sources.js';
 
 /** Env kill switch: unset or anything but "0" means enabled. */
@@ -91,6 +92,11 @@ const LIVE_PACKS = [
     name: 'deldot',
     enabled: () => envEnabled('CCTV_DELDOT_ENABLED'),
     load: loadDelDOTSourcesFromOpenData,
+  },
+  {
+    name: 'taiwan-freeway',
+    enabled: () => envEnabled('CCTV_TAIWAN_FREEWAY_ENABLED'),
+    load: loadTaiwanFreewaySourcesFromOpenData,
   },
 ];
 /**

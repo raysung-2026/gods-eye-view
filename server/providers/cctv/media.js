@@ -505,11 +505,96 @@ export function cctvUpstreamUserAgent(url) {
 }
 
 /**
+ * Extract the `boundary` token from a `multipart/x-mixed-replace` (MJPEG)
+ * content-type header.
+ *
+ * @param {string} contentType
+ * @returns {string} Boundary token, or '' if none is present.
+ */
+function parseMultipartBoundary(contentType) {
+  const match = /boundary=("?)([^";]+)\1/i.exec(String(contentType || ''));
+  return match ? match[2] : '';
+}
+
+/**
+ * Read just enough of a live `multipart/x-mixed-replace` MJPEG stream to
+ * capture ONE complete frame, then stop reading and close the connection.
+ *
+ * An MJPEG camera never ends its stream on its own — reading it to
+ * completion (as `readCappedResponseBytes` does for a normal image) would
+ * either hang or blow the byte cap. Treating it as a source of periodic
+ * stills — one frame extracted per poll, connection closed immediately after
+ * — keeps it inside the same "poll a still" contract every other CCTV
+ * provider already uses, with no client-side changes required.
+ *
+ * @param {Response} upstream - fetch() response whose body is multipart.
+ * @param {string} boundaryToken - Boundary token from the content-type header.
+ * @param {number} maxBytes - Safety cap while searching for one frame.
+ * @returns {Promise<{ok:true,body:Buffer,contentType:string}|null>}
+ */
+async function extractOneMjpegFrame(upstream, boundaryToken, maxBytes) {
+  if (!upstream.body || !boundaryToken) return null;
+  if (typeof upstream.body[Symbol.asyncIterator] !== 'function') return null;
+  const boundaryMarker = Buffer.from(`--${boundaryToken}`);
+  const closeStream = () => {
+    try {
+      upstream.body.cancel?.();
+    } catch {
+      /* no-op */
+    }
+  };
+
+  let buf = Buffer.alloc(0);
+  for await (const chunk of upstream.body) {
+    buf = Buffer.concat([buf, Buffer.from(chunk)]);
+    if (buf.length > maxBytes) {
+      closeStream();
+      return null;
+    }
+
+    const boundaryStart = buf.indexOf(boundaryMarker);
+    if (boundaryStart === -1) continue;
+    const headerStart = boundaryStart + boundaryMarker.length;
+    const headerEnd = buf.indexOf('\r\n\r\n', headerStart);
+    if (headerEnd === -1) continue; // headers not fully received yet
+
+    const headerText = buf.slice(headerStart, headerEnd).toString('latin1');
+    const bodyStart = headerEnd + 4;
+    const lengthMatch = /content-length:\s*(\d+)/i.exec(headerText);
+    const typeMatch = /content-type:\s*([^\r\n]+)/i.exec(headerText);
+    const partContentType = typeMatch ? typeMatch[1].trim() : 'image/jpeg';
+
+    if (lengthMatch) {
+      const declaredLen = Number(lengthMatch[1]);
+      const bodyEnd = bodyStart + declaredLen;
+      if (buf.length < bodyEnd) continue; // wait for the rest of this frame
+      const frame = Buffer.from(buf.slice(bodyStart, bodyEnd));
+      closeStream();
+      return { ok: true, body: frame, contentType: partContentType };
+    }
+
+    // No declared length: the frame runs up to the next boundary marker.
+    const nextBoundary = buf.indexOf(boundaryMarker, bodyStart);
+    if (nextBoundary === -1) continue; // next part hasn't arrived yet
+    let bodyEnd = nextBoundary;
+    if (buf[bodyEnd - 1] === 0x0a && buf[bodyEnd - 2] === 0x0d) bodyEnd -= 2;
+    const frame = Buffer.from(buf.slice(bodyStart, bodyEnd));
+    closeStream();
+    return { ok: true, body: frame, contentType: partContentType };
+  }
+  return null;
+}
+
+/**
  * Fetch one upstream CCTV image within the frame-refresh budget.
  *
  * A timeout is treated like every other upstream miss so the caller can
  * continue through the Street View and synthetic fallback chain. `fetchImpl`
  * and `timeoutMs` are injectable only to keep the timeout contract unit-testable.
+ *
+ * A `multipart/x-mixed-replace` (MJPEG) response is handled the same as a
+ * plain image: one frame is extracted from the live stream and the
+ * connection is closed (see `extractOneMjpegFrame`).
  *
  * @param {string} url - Server-registered upstream image URL.
  * @param {object} [options]
@@ -542,15 +627,24 @@ export async function fetchCctvImageFromUpstream(
       },
       fetchImpl,
     );
-    if (!upstream) return null;
-    const contentType = upstream.headers.get('content-type') || '';
-    if (!upstream.ok || !contentType.startsWith('image/')) {
+    if (!upstream || !upstream.ok) {
       controller.abort();
       return null;
     }
-    const body = await readCappedResponseBytes(upstream, maxBytes);
-    if (!body) return null;
-    return { ok: true, body, contentType };
+    const contentType = upstream.headers.get('content-type') || '';
+    if (contentType.startsWith('image/')) {
+      const body = await readCappedResponseBytes(upstream, maxBytes);
+      if (!body) return null;
+      return { ok: true, body, contentType };
+    }
+    if (/^multipart\/x-mixed-replace/i.test(contentType)) {
+      const boundaryToken = parseMultipartBoundary(contentType);
+      const frame = await extractOneMjpegFrame(upstream, boundaryToken, maxBytes);
+      if (!frame) return null;
+      return frame;
+    }
+    controller.abort();
+    return null;
   } catch {
     return null;
   } finally {

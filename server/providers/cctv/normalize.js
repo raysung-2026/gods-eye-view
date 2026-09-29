@@ -367,6 +367,19 @@ export function isLikelyCalgaryCoordinate(lat, lon) {
   );
 }
 
+/** Taiwan's main island, with slack for the freeway network's northern and
+ * southern tips. Outlying islands (Penghu, Kinmen, Matsu) carry no national
+ * freeway and are outside this box on purpose. */
+export function isLikelyTaiwanCoordinate(lat, lon) {
+  return (
+    isPlausibleLatLon(lat, lon) &&
+    lat >= 21.7 &&
+    lat <= 25.4 &&
+    lon >= 119.9 &&
+    lon <= 122.1
+  );
+}
+
 export function isLikelyFinlandCoordinate(lat, lon) {
   if (!Number.isFinite(lat) || !Number.isFinite(lon)) return false;
   return lat >= 59.5 && lat <= 70.5 && lon >= 19 && lon <= 32;
