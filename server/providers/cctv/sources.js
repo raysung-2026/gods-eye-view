@@ -34,6 +34,10 @@ import {
   TXDOT_ANCHORS,
   TXDOT_DISTRICT_ELEVATION_M,
   TXDOT_DEFAULT_ELEVATION_M,
+  TAIWAN_FREEWAY_CCTV_URL,
+  TAIWAN_FREEWAY_IMAGE_ORIGINS,
+  DEFAULT_TAIWAN_FREEWAY_MAX_SOURCES,
+  TAIWAN_ANCHORS,
   DEFAULT_TALLINN_SOURCE_FILE,
   DEFAULT_TALLINN_MAX_SOURCES,
   TALLINN_IMAGE_ORIGIN,
@@ -76,6 +80,7 @@ import {
   isLikelyTexasCoordinate,
   isLikelyNswCoordinate,
   isLikelyCalgaryCoordinate,
+  isLikelyTaiwanCoordinate,
   cameraDisplayCode,
   rowArrayToObject,
   prioritizeSources,
@@ -345,6 +350,11 @@ export async function loadTflSourcesFromOpenData() {
       if (!Number.isFinite(lat) || !Number.isFinite(lon)) continue;
       const imageUrl = String(props.imageUrl || '');
       if (!imageUrl.startsWith(TFL_IMAGE_ORIGIN)) continue; // official-bucket pin
+      // JamCam entries also carry a short looping clip on the same official
+      // bucket (same path, .mp4 instead of .jpg). Same origin pin as the
+      // still — a camera without one just keeps the stills-only fallback.
+      const videoUrlRaw = String(props.videoUrl || '');
+      const hasLiveVideo = videoUrlRaw.startsWith(TFL_IMAGE_ORIGIN);
 
       // "JamCams_00002.00865" → "tfl-00002.00865" (provider-stable id).
       const rawId = String(place?.id || '').replace(/^JamCams_/, '');
@@ -368,8 +378,10 @@ export async function loadTflSourcesFromOpenData() {
         rangeM: 145,
         mountHeightM: 8,
         groundElevationM: 15, // Thames-basin prior; one-shot snap corrects.
-        feedType: 'image', // stills-first (owner decision); props.videoUrl deliberately unused
-        url: imageUrl,
+        // Live video where TfL publishes one; snapshotUrl stays the stills
+        // fallback the /frame endpoint reaches for on any video failure.
+        feedType: hasLiveVideo ? 'mp4' : 'image',
+        url: hasLiveVideo ? videoUrlRaw : imageUrl,
         snapshotUrl: imageUrl,
         sourceKind: 'tfl-open-data',
         license: 'Powered by TfL Open Data',
@@ -1696,6 +1708,127 @@ export async function loadDelDOTSourcesFromOpenData() {
   } catch (error) {
     console.warn(
       '[CCTV] DelDOT source download error:',
+      error?.message || error,
+    );
+    return [];
+  }
+}
+
+/**
+ * Direction token embedded in a Taiwan freeway camera id, e.g. the "S" in
+ * "CCTV-N1-S-0.000-M". Only the four cardinal single letters are recognised —
+ * directionToHeading() is built for word tokens (NB/SOUTHBOUND), not a bare
+ * single character, so this is a dedicated lookup rather than reusing it.
+ */
+const TAIWAN_DIRECTION_HEADING = Object.freeze({
+  N: 0,
+  E: 90,
+  S: 180,
+  W: 270,
+});
+
+/**
+ * One row of the THB (Freeway Bureau) public freeway-camera JSON -> one
+ * catalog source, or null.
+ *
+ * Row shape (keyless, no auth): `id` ("CCTV-N1-S-0.000-M"), `stakenumber`
+ * (Chinese road/section description used as the name), `gisx`/`gisy`
+ * (lon/lat), `html` (a live MJPEG stream on one of two official hosts).
+ *
+ * @param {object} row - Raw record from TAIWAN_FREEWAY_CCTV_URL.
+ * @returns {?object}
+ */
+export function taiwanFreewayCameraToSource(row) {
+  if (!row || typeof row !== 'object') return null;
+  const lon = toFiniteNumber(row?.gisx);
+  const lat = toFiniteNumber(row?.gisy);
+  if (!isLikelyTaiwanCoordinate(lat, lon)) return null;
+
+  const streamUrl = String(row?.html || '').trim();
+  if (
+    !TAIWAN_FREEWAY_IMAGE_ORIGINS.some((origin) => streamUrl.startsWith(origin))
+  )
+    return null; // official-bucket pin
+
+  const rawId = String(row?.id || '').trim();
+  if (!/^[A-Za-z0-9_.-]{1,80}$/.test(rawId)) return null;
+  const cameraId = `tw-freeway-${rawId.toLowerCase()}`;
+
+  const name = String(row?.stakenumber || '').trim() || `Taiwan Freeway ${rawId}`;
+  const directionToken = rawId.match(/-([NSEW])-/)?.[1];
+  const heading = directionToken ? TAIWAN_DIRECTION_HEADING[directionToken] : NaN;
+  const hasHeading = Number.isFinite(heading);
+
+  return {
+    id: cameraId,
+    name,
+    city: 'Taiwan',
+    cityId: 'taiwan-freeway',
+    provider: 'Freeway Bureau, MOTC (Taiwan)',
+    lat,
+    lon,
+    headingDeg: hasHeading ? heading : fallbackHeadingFromId(cameraId),
+    headingConfidence: hasHeading ? 'medium' : 'low',
+    pitchDeg: hasHeading ? -22 : -18,
+    fovDeg: hasHeading ? 52 : 44,
+    rangeM: hasHeading ? 190 : 145,
+    mountHeightM: hasHeading ? 9 : 8,
+    groundElevationM: 30, // Island-wide low-lying prior; client ground snap corrects it.
+    // Live MJPEG (multipart/x-mixed-replace): the frame proxy extracts one
+    // JPEG per poll (see fetchCctvImageFromUpstream), so this is served
+    // exactly like every other stills-only provider — no snapshotUrl needed.
+    feedType: 'mjpeg',
+    url: streamUrl,
+    snapshotUrl: '',
+    sourceKind: 'taiwan-freeway-open-data',
+    license: 'Public domain — Freeway Bureau, MOTC (Taiwan)',
+    code: cameraDisplayCode(name),
+  };
+}
+
+/**
+ * Fetch Taiwan national-freeway CCTV cameras from the Freeway Bureau's
+ * public, keyless JSON endpoint. Streams are live MJPEG.
+ *
+ * @returns {Promise<Array<object>>} Normalized camera source objects.
+ */
+export async function loadTaiwanFreewaySourcesFromOpenData() {
+  try {
+    const resp = await fetch(TAIWAN_FREEWAY_CCTV_URL, {
+      headers: {
+        Accept: 'application/json',
+        'User-Agent': 'gods-eye-view-cctv-proxy/1.0',
+      },
+      signal: AbortSignal.timeout(CCTV_SOURCE_FETCH_TIMEOUT_MS),
+    });
+    if (!resp.ok) {
+      console.warn(
+        '[CCTV] Taiwan freeway camera download failed:',
+        resp.status,
+      );
+      return [];
+    }
+    const payload = await readResponseJsonCapped(resp, 8 * 1024 * 1024);
+    const rows = Array.isArray(payload) ? payload : [];
+    const cameras = rows.map(taiwanFreewayCameraToSource).filter(Boolean);
+    const unique = Array.from(
+      new Map(cameras.map((camera) => [camera.id, camera])).values(),
+    );
+    const maxRaw = Number(
+      process.env.CCTV_TAIWAN_FREEWAY_MAX_SOURCES ||
+        DEFAULT_TAIWAN_FREEWAY_MAX_SOURCES,
+    );
+    const maxCount = Number.isFinite(maxRaw)
+      ? Math.max(8, Math.min(900, Math.floor(maxRaw)))
+      : DEFAULT_TAIWAN_FREEWAY_MAX_SOURCES;
+    const prioritized = prioritizeSources(unique, maxCount, TAIWAN_ANCHORS);
+    console.log(
+      `[CCTV] Loaded Taiwan freeway camera sources: ${unique.length} (using nearest ${prioritized.length})`,
+    );
+    return prioritized;
+  } catch (error) {
+    console.warn(
+      '[CCTV] Taiwan freeway camera download error:',
       error?.message || error,
     );
     return [];

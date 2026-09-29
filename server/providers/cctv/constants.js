@@ -246,6 +246,28 @@ export const DELDOT_ANCHORS = [
 ];
 /** Camera CATALOGS change rarely; 15 min keeps multi-megabyte upstream list refetches (Austin rows.json + 4 Caltrans districts + TfL + Ontario 511) infrequent. Frames are fetched per-request and are unaffected. */
 export const CCTV_SOURCE_CACHE_MS = 15 * 60 * 1000;
+/** Taiwan national freeways (國道): keyless JSON catalog from the Freeway
+ * Bureau's public app backend. Each row's `html` field is a LIVE MJPEG stream
+ * (multipart/x-mixed-replace), not a still — media.js extracts one frame per
+ * poll from it, same "poll a still" contract as every other CCTV provider. */
+export const TAIWAN_FREEWAY_CCTV_URL =
+  'https://thbapp.thb.gov.tw/services/cctv/freeway';
+/** The only origins a Taiwan freeway camera's stream URL may come from. */
+export const TAIWAN_FREEWAY_IMAGE_ORIGINS = Object.freeze([
+  'https://cctvn.freeway.gov.tw/',
+  'https://cctvs.freeway.gov.tw/',
+]);
+export const DEFAULT_TAIWAN_FREEWAY_MAX_SOURCES = 250;
+/** Prioritization anchors: the metro cores strung along the National 1/3
+ * corridor, so a cap keeps island-wide coverage rather than just Taipei. */
+export const TAIWAN_ANCHORS = [
+  { lat: 25.033, lon: 121.5654 }, // Taipei
+  { lat: 24.1477, lon: 120.6736 }, // Taichung
+  { lat: 22.6273, lon: 120.3014 }, // Kaohsiung
+  { lat: 24.8138, lon: 120.9675 }, // Hsinchu
+  { lat: 23.4791, lon: 120.4472 }, // Chiayi/Tainan corridor
+];
+
 /** Per-provider catalog-fetch timeout. Bounds the worst-case refresh so one
  * stalled upstream can't leave getCctvSources (and thus every CCTV route)
  * pending forever — a hung fetch aborts, the loader returns [], and
